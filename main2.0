@@ -1,0 +1,830 @@
+import os
+import hashlib
+import hmac
+import binascii
+import sqlite3
+import base64
+import tkinter as tk
+from tkinter import messagebox
+from tkinter import ttk
+
+# Importar librería de cifrado (Fernet usa AES-128-CBC + HMAC-SHA256)
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+except ImportError:
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "cryptography"])
+    from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+
+# Archivo de la base de datos
+DB_FILE = "passwords.db"
+ICONO_FILE = "baul.ico"
+MIN_PASSWORD_LENGTH = 8
+
+# Variable global para la instancia de cifrado (se establece tras login exitoso)
+_fernet_instance = None
+
+
+# --- FUNCIONES DE SEGURIDAD (PBKDF2 HMAC SHA-256) ---
+def hash_password(password: str, salt: bytes = None) -> tuple[str, str]:
+    """Genera el hash PBKDF2 de una contraseña usando un salt criptográfico."""
+    if salt is None:
+        salt = os.urandom(16)
+    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+    return binascii.hexlify(pwd_hash).decode('ascii'), binascii.hexlify(salt).decode('ascii')
+
+
+def verificar_password(password: str, stored_hash: str, stored_salt: str) -> bool:
+    """Verifica si la contraseña ingresada coincide con el hash guardado."""
+    try:
+        salt_bytes = binascii.unhexlify(stored_salt)
+        pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt_bytes, 100000)
+        computed_hash = binascii.hexlify(pwd_hash).decode('ascii')
+        return hmac.compare_digest(computed_hash, stored_hash)
+    except Exception:
+        return False
+
+
+# --- FUNCIONES DE CIFRADO AES (vía Fernet) ---
+def derivar_clave_cifrado(password: str, salt: bytes) -> bytes:
+    """Deriva una clave de cifrado de 32 bytes desde la contraseña maestra con PBKDF2."""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=200000,
+    )
+    key = base64.urlsafe_b64encode(kdf.derive(password.encode('utf-8')))
+    return key
+
+
+def establecer_cifrado(password: str, encryption_salt_hex: str):
+    """Establece la instancia global de Fernet para cifrar/descifrar contraseñas."""
+    global _fernet_instance
+    salt = binascii.unhexlify(encryption_salt_hex)
+    key = derivar_clave_cifrado(password, salt)
+    _fernet_instance = Fernet(key)
+
+
+def cifrar_texto(texto: str) -> str:
+    """Cifra un texto usando Fernet (AES-128-CBC + HMAC-SHA256)."""
+    if _fernet_instance is None:
+        raise RuntimeError("El sistema de cifrado no ha sido inicializado.")
+    return _fernet_instance.encrypt(texto.encode('utf-8')).decode('ascii')
+
+
+def descifrar_texto(texto_cifrado: str) -> str:
+    """Descifra un texto previamente cifrado con Fernet."""
+    if _fernet_instance is None:
+        raise RuntimeError("El sistema de cifrado no ha sido inicializado.")
+    return _fernet_instance.decrypt(texto_cifrado.encode('ascii')).decode('utf-8')
+
+
+# --- BASE DE DATOS ---
+def inicializar_db():
+    """Crea las tablas necesarias si no existen."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        # Tabla de credenciales (con columna 'cifrado' para saber si está encriptada)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS credenciales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sitio TEXT NOT NULL,
+                usuario TEXT NOT NULL,
+                contrasena TEXT NOT NULL,
+                cifrado INTEGER NOT NULL DEFAULT 0
+            )
+        ''')
+        # Tabla para contraseña maestra (con salt de cifrado separado)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS seguridad (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                encryption_salt TEXT
+            )
+        ''')
+        conn.commit()
+    except Exception as e:
+        print(f"Error inicializando DB: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def migrar_esquema_db():
+    """Agrega columnas nuevas a tablas existentes (para bases de datos antiguas)."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # Agregar columna encryption_salt a seguridad
+    try:
+        cursor.execute("ALTER TABLE seguridad ADD COLUMN encryption_salt TEXT")
+    except sqlite3.OperationalError:
+        pass  # La columna ya existe
+    # Agregar columna cifrado a credenciales
+    try:
+        cursor.execute("ALTER TABLE credenciales ADD COLUMN cifrado INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # La columna ya existe
+    conn.commit()
+    conn.close()
+
+
+def obtener_datos_maestra():
+    """Obtiene hash, salt y encryption_salt de la contraseña maestra."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT password_hash, salt, encryption_salt FROM seguridad WHERE id = 1")
+        fila = cursor.fetchone()
+        conn.close()
+        return fila  # (password_hash, salt, encryption_salt) o None
+    except Exception as e:
+        print(f"Error al consultar seguridad: {e}")
+        return None
+
+
+def guardar_contrasena_maestra(nueva_contrasena: str):
+    """Guarda o actualiza la contraseña maestra con su hash y salt de cifrado."""
+    pwd_hash, salt = hash_password(nueva_contrasena)
+    encryption_salt = os.urandom(16)
+    encryption_salt_hex = binascii.hexlify(encryption_salt).decode('ascii')
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM seguridad WHERE id = 1")
+    cursor.execute(
+        "INSERT INTO seguridad (id, password_hash, salt, encryption_salt) VALUES (1, ?, ?, ?)",
+        (pwd_hash, salt, encryption_salt_hex)
+    )
+    conn.commit()
+    conn.close()
+
+    # Establecer cifrado inmediatamente con la nueva clave
+    establecer_cifrado(nueva_contrasena, encryption_salt_hex)
+
+
+def migrar_contraseñas_planas():
+    """Cifra todas las contraseñas que aún están almacenadas en texto plano."""
+    if _fernet_instance is None:
+        return
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, contrasena FROM credenciales WHERE cifrado = 0")
+        filas = cursor.fetchall()
+        for id_reg, contrasena_plana in filas:
+            contrasena_cifrada = cifrar_texto(contrasena_plana)
+            cursor.execute(
+                "UPDATE credenciales SET contrasena = ?, cifrado = 1 WHERE id = ?",
+                (contrasena_cifrada, id_reg)
+            )
+        conn.commit()
+        conn.close()
+        if filas:
+            print(f"✅ {len(filas)} contraseña(s) migrada(s) a formato cifrado.")
+    except Exception as e:
+        print(f"Error durante migración de contraseñas: {e}")
+
+
+def generar_encryption_salt_si_falta(password: str):
+    """Si la DB antigua no tiene encryption_salt, lo genera y lo guarda."""
+    datos = obtener_datos_maestra()
+    if datos and datos[2] is None:
+        encryption_salt = os.urandom(16)
+        encryption_salt_hex = binascii.hexlify(encryption_salt).decode('ascii')
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE seguridad SET encryption_salt = ? WHERE id = 1", (encryption_salt_hex,))
+        conn.commit()
+        conn.close()
+        establecer_cifrado(password, encryption_salt_hex)
+        return encryption_salt_hex
+    elif datos:
+        return datos[2]
+    return None
+
+
+# Inicializamos la base de datos
+inicializar_db()
+migrar_esquema_db()
+
+
+# --- UTILIDADES VISUALES ---
+def aplicar_icono(ventana):
+    if os.path.exists(ICONO_FILE):
+        try:
+            ventana.iconbitmap(ICONO_FILE)
+        except Exception:
+            pass
+
+
+def centrar_ventana(ventana, ancho, alto):
+    ventana.update_idletasks()
+    x = (ventana.winfo_screenwidth() // 2) - (ancho // 2)
+    y = (ventana.winfo_screenheight() // 2) - (alto // 2)
+    ventana.geometry(f"{ancho}x{alto}+{x}+{y}")
+
+
+def validar_longitud_contrasena(contrasena: str, parent=None) -> bool:
+    """Valida que la contraseña tenga la longitud mínima requerida."""
+    if len(contrasena) < MIN_PASSWORD_LENGTH:
+        messagebox.showwarning(
+            "Contraseña débil",
+            f"La contraseña debe tener al menos {MIN_PASSWORD_LENGTH} caracteres.",
+            parent=parent
+        )
+        return False
+    return True
+
+
+# --- VENTANAS DE AUTENTICACIÓN ---
+def solicitar_acceso_maestro():
+    global _fernet_instance
+    _fernet_instance = None  # Limpiar cifrado al bloquear
+    root.withdraw()
+    datos_maestra = obtener_datos_maestra()
+
+    if datos_maestra is None:
+        # Primera vez: crear contraseña maestra
+        mostrar_ventana_configuracion_inicial()
+    else:
+        # Ya existe: pedir contraseña de acceso
+        mostrar_ventana_login(datos_maestra)
+
+
+def mostrar_ventana_configuracion_inicial():
+    ventana_setup = tk.Toplevel(root)
+    ventana_setup.title("Configurar Contraseña Maestra")
+    ventana_setup.resizable(False, False)
+    aplicar_icono(ventana_setup)
+    centrar_ventana(ventana_setup, 380, 280)
+    ventana_setup.protocol("WM_DELETE_WINDOW", root.destroy)
+    ventana_setup.grab_set()
+
+    lbl_info = tk.Label(
+        ventana_setup,
+        text="🔐 Configuración Inicial\nCree una contraseña maestra para proteger su baúl:",
+        font=("Arial", 10, "bold"),
+        justify="center"
+    )
+    lbl_info.pack(pady=10)
+
+    frame_campos = tk.Frame(ventana_setup)
+    frame_campos.pack(padx=20, pady=5)
+
+    tk.Label(frame_campos, text="Nueva Contraseña:", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="e", pady=5, padx=5)
+    entry_nueva = tk.Entry(frame_campos, width=22, font=("Arial", 10), show="*")
+    entry_nueva.grid(row=0, column=1, pady=5)
+    entry_nueva.focus()
+
+    tk.Label(frame_campos, text="Confirmar Contraseña:", font=("Arial", 9, "bold")).grid(row=1, column=0, sticky="e", pady=5, padx=5)
+    entry_confirmar = tk.Entry(frame_campos, width=22, font=("Arial", 10), show="*")
+    entry_confirmar.grid(row=1, column=1, pady=5)
+
+    mostrar_var = tk.BooleanVar(value=False)
+    def toggle_ver():
+        modo = "" if mostrar_var.get() else "*"
+        entry_nueva.config(show=modo)
+        entry_confirmar.config(show=modo)
+
+    chk_mostrar = tk.Checkbutton(ventana_setup, text="Mostrar contraseñas", variable=mostrar_var, command=toggle_ver, font=("Arial", 8))
+    chk_mostrar.pack()
+
+    lbl_requisito = tk.Label(
+        ventana_setup,
+        text=f"(Mínimo {MIN_PASSWORD_LENGTH} caracteres)",
+        font=("Arial", 8),
+        fg="gray"
+    )
+    lbl_requisito.pack()
+
+    def guardar_inicial(event=None):
+        pwd1 = entry_nueva.get()
+        pwd2 = entry_confirmar.get()
+
+        if not pwd1 or not pwd2:
+            messagebox.showwarning("Advertencia", "Por favor complete ambos campos.", parent=ventana_setup)
+            return
+
+        if not validar_longitud_contrasena(pwd1, parent=ventana_setup):
+            entry_nueva.delete(0, tk.END)
+            entry_confirmar.delete(0, tk.END)
+            entry_nueva.focus()
+            return
+
+        if pwd1 != pwd2:
+            messagebox.showerror("Error", "Las contraseñas no coinciden. Intente de nuevo.", parent=ventana_setup)
+            entry_nueva.delete(0, tk.END)
+            entry_confirmar.delete(0, tk.END)
+            entry_nueva.focus()
+            return
+
+        guardar_contrasena_maestra(pwd1)
+        messagebox.showinfo("Éxito", "¡Contraseña maestra configurada correctamente!\nSus credenciales serán cifradas con AES.", parent=ventana_setup)
+        ventana_setup.destroy()
+        centrar_ventana(root, 420, 360)
+        root.deiconify()
+
+    entry_confirmar.bind("<Return>", guardar_inicial)
+    entry_nueva.bind("<Return>", lambda e: entry_confirmar.focus())
+
+    btn_crear = tk.Button(
+        ventana_setup,
+        text="Crear Contraseña y Continuar",
+        command=guardar_inicial,
+        bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), cursor="hand2"
+    )
+    btn_crear.pack(pady=12)
+
+
+def mostrar_ventana_login(datos_maestra):
+    stored_hash, stored_salt, encryption_salt = datos_maestra
+
+    ventana_login = tk.Toplevel(root)
+    ventana_login.title("Acceso Seguro")
+    ventana_login.resizable(False, False)
+    aplicar_icono(ventana_login)
+    centrar_ventana(ventana_login, 360, 220)
+    ventana_login.protocol("WM_DELETE_WINDOW", root.destroy)
+    ventana_login.grab_set()
+
+    lbl_titulo = tk.Label(
+        ventana_login,
+        text="🔐 Baúl de Contraseñas Protegido",
+        font=("Arial", 11, "bold")
+    )
+    lbl_titulo.pack(pady=10)
+
+    lbl_sub = tk.Label(ventana_login, text="Ingrese la contraseña maestra para continuar:", font=("Arial", 9))
+    lbl_sub.pack(pady=2)
+
+    entry_pass = tk.Entry(ventana_login, width=28, font=("Arial", 11), show="*")
+    entry_pass.pack(pady=8)
+    entry_pass.focus()
+
+    mostrar_var = tk.BooleanVar(value=False)
+    def toggle_ver():
+        entry_pass.config(show="" if mostrar_var.get() else "*")
+
+    chk_mostrar = tk.Checkbutton(ventana_login, text="Mostrar contraseña", variable=mostrar_var, command=toggle_ver, font=("Arial", 8))
+    chk_mostrar.pack()
+
+    def verificar_acceso(event=None):
+        intento = entry_pass.get()
+        if not intento:
+            messagebox.showwarning("Advertencia", "Por favor ingrese la contraseña.", parent=ventana_login)
+            return
+
+        if verificar_password(intento, stored_hash, stored_salt):
+            # Establecer cifrado tras login exitoso
+            enc_salt = encryption_salt
+            if enc_salt is None:
+                # DB antigua sin encryption_salt: generar uno nuevo
+                enc_salt = generar_encryption_salt_si_falta(intento)
+            else:
+                establecer_cifrado(intento, enc_salt)
+
+            # Migrar contraseñas en texto plano a formato cifrado
+            migrar_contraseñas_planas()
+
+            ventana_login.destroy()
+            centrar_ventana(root, 420, 360)
+            root.deiconify()
+        else:
+            messagebox.showerror("Acceso Denegado", "Contraseña maestra incorrecta.", parent=ventana_login)
+            entry_pass.delete(0, tk.END)
+            entry_pass.focus()
+
+    entry_pass.bind("<Return>", verificar_acceso)
+
+    frame_btns = tk.Frame(ventana_login)
+    frame_btns.pack(pady=10)
+
+    btn_entrar = tk.Button(
+        frame_btns, text="Entrar", command=verificar_acceso,
+        bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), width=10, cursor="hand2"
+    )
+    btn_entrar.pack(side="left", padx=5)
+
+    btn_salir = tk.Button(
+        frame_btns, text="Salir", command=root.destroy,
+        bg="#f44336", fg="white", font=("Arial", 10, "bold"), width=10, cursor="hand2"
+    )
+    btn_salir.pack(side="left", padx=5)
+
+
+def cambiar_contrasena_maestra():
+    ventana_cambio = tk.Toplevel(root)
+    ventana_cambio.title("Cambiar Contraseña Maestra")
+    ventana_cambio.resizable(False, False)
+    aplicar_icono(ventana_cambio)
+    centrar_ventana(ventana_cambio, 400, 290)
+    ventana_cambio.grab_set()
+
+    lbl_info = tk.Label(ventana_cambio, text="Actualizar Contraseña Maestra", font=("Arial", 11, "bold"))
+    lbl_info.pack(pady=10)
+
+    frame_campos = tk.Frame(ventana_cambio)
+    frame_campos.pack(padx=15, pady=5)
+
+    font_lbl = ("Arial", 9, "bold")
+    tk.Label(frame_campos, text="Contraseña Actual:", font=font_lbl).grid(row=0, column=0, sticky="e", pady=4, padx=5)
+    entry_actual = tk.Entry(frame_campos, width=22, font=("Arial", 10), show="*")
+    entry_actual.grid(row=0, column=1, pady=4)
+    entry_actual.focus()
+
+    tk.Label(frame_campos, text="Nueva Contraseña:", font=font_lbl).grid(row=1, column=0, sticky="e", pady=4, padx=5)
+    entry_nueva = tk.Entry(frame_campos, width=22, font=("Arial", 10), show="*")
+    entry_nueva.grid(row=1, column=1, pady=4)
+
+    tk.Label(frame_campos, text="Confirmar Nueva:", font=font_lbl).grid(row=2, column=0, sticky="e", pady=4, padx=5)
+    entry_confirmar = tk.Entry(frame_campos, width=22, font=("Arial", 10), show="*")
+    entry_confirmar.grid(row=2, column=1, pady=4)
+
+    mostrar_var = tk.BooleanVar(value=False)
+    def toggle_ver():
+        modo = "" if mostrar_var.get() else "*"
+        entry_actual.config(show=modo)
+        entry_nueva.config(show=modo)
+        entry_confirmar.config(show=modo)
+
+    chk_mostrar = tk.Checkbutton(ventana_cambio, text="Mostrar contraseñas", variable=mostrar_var, command=toggle_ver, font=("Arial", 8))
+    chk_mostrar.pack()
+
+    lbl_requisito = tk.Label(
+        ventana_cambio,
+        text=f"(Mínimo {MIN_PASSWORD_LENGTH} caracteres)",
+        font=("Arial", 8),
+        fg="gray"
+    )
+    lbl_requisito.pack()
+
+    def procesar_cambio():
+        actual = entry_actual.get()
+        nueva = entry_nueva.get()
+        confirmar = entry_confirmar.get()
+
+        if not actual or not nueva or not confirmar:
+            messagebox.showwarning("Advertencia", "Por favor complete todos los campos.", parent=ventana_cambio)
+            return
+
+        datos_maestra = obtener_datos_maestra()
+        if datos_maestra is None or not verificar_password(actual, datos_maestra[0], datos_maestra[1]):
+            messagebox.showerror("Error", "La contraseña actual es incorrecta.", parent=ventana_cambio)
+            entry_actual.delete(0, tk.END)
+            entry_actual.focus()
+            return
+
+        if nueva != confirmar:
+            messagebox.showerror("Error", "La nueva contraseña y su confirmación no coinciden.", parent=ventana_cambio)
+            entry_nueva.delete(0, tk.END)
+            entry_confirmar.delete(0, tk.END)
+            entry_nueva.focus()
+            return
+
+        if not validar_longitud_contrasena(nueva, parent=ventana_cambio):
+            entry_nueva.delete(0, tk.END)
+            entry_confirmar.delete(0, tk.END)
+            entry_nueva.focus()
+            return
+
+        # Paso 1: Descifrar todas las contraseñas con la clave actual
+        contraseñas_descifradas = []
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, contrasena, cifrado FROM credenciales")
+            filas = cursor.fetchall()
+            conn.close()
+            for id_reg, contrasena, cifrado in filas:
+                if cifrado:
+                    contrasena = descifrar_texto(contrasena)
+                contraseñas_descifradas.append((id_reg, contrasena))
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al preparar migración: {e}", parent=ventana_cambio)
+            return
+
+        # Paso 2: Guardar nueva contraseña maestra (genera nuevo encryption_salt y Fernet)
+        guardar_contrasena_maestra(nueva)
+
+        # Paso 3: Re-cifrar todas las contraseñas con la nueva clave
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            for id_reg, contrasena_plana in contraseñas_descifradas:
+                contrasena_cifrada = cifrar_texto(contrasena_plana)
+                cursor.execute(
+                    "UPDATE credenciales SET contrasena = ?, cifrado = 1 WHERE id = ?",
+                    (contrasena_cifrada, id_reg)
+                )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al re-cifrar contraseñas: {e}", parent=ventana_cambio)
+            return
+
+        messagebox.showinfo(
+            "Éxito",
+            "¡Contraseña maestra actualizada!\nTodas las credenciales han sido re-cifradas con la nueva clave.",
+            parent=ventana_cambio
+        )
+        ventana_cambio.destroy()
+
+    btn_actualizar = tk.Button(
+        ventana_cambio, text="Guardar Nueva Contraseña", command=procesar_cambio,
+        bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), cursor="hand2"
+    )
+    btn_actualizar.pack(pady=12)
+
+
+# --- OPERACIONES CON CREDENCIALES ---
+def guardar_datos():
+    sitio = entry_sitio.get()
+    usuario = entry_usuario.get()
+    contrasena = entry_contrasena.get()
+
+    # Validación básica
+    if not sitio or not usuario or not contrasena:
+        messagebox.showwarning("Advertencia", "Por favor, complete todos los campos.", parent=root)
+        return
+
+    try:
+        # Cifrar la contraseña antes de guardarla
+        contrasena_cifrada = cifrar_texto(contrasena)
+
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO credenciales (sitio, usuario, contrasena, cifrado) VALUES (?, ?, ?, 1)",
+            (sitio, usuario, contrasena_cifrada)
+        )
+        conn.commit()
+        conn.close()
+
+        # Mostrar ventana de confirmación con opción de copiar
+        ventana_copiado = tk.Toplevel(root)
+        ventana_copiado.title("✅ Guardado Exitoso")
+        ventana_copiado.resizable(False, False)
+        aplicar_icono(ventana_copiado)
+        centrar_ventana(ventana_copiado, 380, 200)
+        ventana_copiado.grab_set()
+
+        tk.Label(
+            ventana_copiado,
+            text="🔒 Credenciales guardadas y cifradas\ncorrectamente.",
+            font=("Arial", 10, "bold"), justify="center"
+        ).pack(pady=12)
+
+        tk.Label(
+            ventana_copiado,
+            text=f"Sitio: {sitio}  |  Usuario: {usuario}",
+            font=("Arial", 9), fg="gray"
+        ).pack(pady=2)
+
+        lbl_copiado = tk.Label(ventana_copiado, text="", font=("Arial", 8), fg="#4CAF50")
+        lbl_copiado.pack()
+
+        def copiar_contrasena():
+            root.clipboard_clear()
+            root.clipboard_append(contrasena)
+            root.update()
+            lbl_copiado.config(text="✅ ¡Contraseña copiada al portapapeles!")
+
+        frame_btns_copia = tk.Frame(ventana_copiado)
+        frame_btns_copia.pack(pady=10)
+
+        btn_copiar = tk.Button(
+            frame_btns_copia, text="📋 Copiar Contraseña", command=copiar_contrasena,
+            bg="#2196F3", fg="white", font=("Arial", 10, "bold"), cursor="hand2"
+        )
+        btn_copiar.pack(side="left", padx=5)
+
+        btn_cerrar_copia = tk.Button(
+            frame_btns_copia, text="Cerrar", command=ventana_copiado.destroy,
+            bg="#607D8B", fg="white", font=("Arial", 10, "bold"), cursor="hand2"
+        )
+        btn_cerrar_copia.pack(side="left", padx=5)
+
+        # Limpiar campos después de guardar
+        entry_sitio.delete(0, tk.END)
+        entry_usuario.delete(0, tk.END)
+        entry_contrasena.delete(0, tk.END)
+        entry_sitio.focus()
+    except Exception as e:
+        messagebox.showerror("Error", f"Ocurrió un error al guardar: {e}", parent=root)
+
+
+def ver_registros():
+    ventana_registros = tk.Toplevel(root)
+    ventana_registros.title("Contraseñas Guardadas")
+    aplicar_icono(ventana_registros)
+    centrar_ventana(ventana_registros, 560, 400)
+
+    # Variable para controlar visibilidad de contraseñas
+    contrasenas_visibles = tk.BooleanVar(value=False)
+
+    # Frame superior con controles
+    frame_top = tk.Frame(ventana_registros)
+    frame_top.pack(fill="x", padx=10, pady=5)
+
+    lbl_titulo = tk.Label(frame_top, text="🔒 Credenciales Almacenadas (Cifradas con AES)", font=("Arial", 9, "bold"))
+    lbl_titulo.pack(side="left")
+
+    # Crear Treeview
+    tree = ttk.Treeview(ventana_registros, columns=("ID", "Sitio", "Usuario", "Contrasena"), show="headings")
+    tree.heading("ID", text="ID")
+    tree.heading("Sitio", text="Sitio / App")
+    tree.heading("Usuario", text="Usuario")
+    tree.heading("Contrasena", text="Contraseña")
+
+    tree.column("ID", width=35, anchor="center")
+    tree.column("Sitio", width=150)
+    tree.column("Usuario", width=150)
+    tree.column("Contrasena", width=180)
+    tree.pack(fill="both", expand=True, padx=10, pady=5)
+
+    # Almacenar contraseñas descifradas en memoria (para toggle de visibilidad)
+    datos_descifrados = []
+
+    def cargar_datos():
+        """Carga y descifra los datos desde la base de datos."""
+        nonlocal datos_descifrados
+        datos_descifrados.clear()
+        for item in tree.get_children():
+            tree.delete(item)
+
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, sitio, usuario, contrasena, cifrado FROM credenciales")
+            filas = cursor.fetchall()
+            conn.close()
+
+            for id_reg, sitio, usuario, contrasena, cifrado in filas:
+                contrasena_real = contrasena
+                if cifrado:
+                    try:
+                        contrasena_real = descifrar_texto(contrasena)
+                    except (InvalidToken, Exception):
+                        contrasena_real = "⚠️ Error al descifrar"
+
+                datos_descifrados.append((id_reg, sitio, usuario, contrasena_real))
+
+                # Mostrar oculta o visible según el toggle
+                pwd_display = contrasena_real if contrasenas_visibles.get() else "•" * min(len(contrasena_real), 12)
+                tree.insert("", tk.END, values=(id_reg, sitio, usuario, pwd_display))
+
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo leer la base de datos: {e}", parent=ventana_registros)
+
+    def toggle_visibilidad():
+        """Alterna entre mostrar y ocultar contraseñas en la tabla."""
+        for item in tree.get_children():
+            tree.delete(item)
+        for id_reg, sitio, usuario, contrasena_real in datos_descifrados:
+            pwd_display = contrasena_real if contrasenas_visibles.get() else "•" * min(len(contrasena_real), 12)
+            tree.insert("", tk.END, values=(id_reg, sitio, usuario, pwd_display))
+
+    chk_ver = tk.Checkbutton(
+        frame_top, text="Mostrar contraseñas",
+        variable=contrasenas_visibles, command=toggle_visibilidad,
+        font=("Arial", 8)
+    )
+    chk_ver.pack(side="right")
+
+    # Cargar datos iniciales
+    cargar_datos()
+
+    # Función para eliminar el registro seleccionado
+    def eliminar_registro():
+        seleccion = tree.selection()
+        if not seleccion:
+            messagebox.showwarning("Advertencia", "Por favor, seleccione un registro de la tabla.", parent=ventana_registros)
+            return
+
+        # Pedir confirmación
+        respuesta = messagebox.askyesno("Confirmar", "¿Está seguro de eliminar esta contraseña?", parent=ventana_registros)
+        if respuesta:
+            item = tree.item(seleccion[0])
+            registro_id = item['values'][0]
+
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM credenciales WHERE id = ?", (registro_id,))
+                conn.commit()
+                conn.close()
+
+                # Recargar datos para mantener sincronizado
+                cargar_datos()
+                messagebox.showinfo("Éxito", "Registro eliminado correctamente.", parent=ventana_registros)
+            except Exception as e:
+                messagebox.showerror("Error", f"Ocurrió un error al eliminar: {e}", parent=ventana_registros)
+
+    # Función para copiar la contraseña del registro seleccionado
+    def copiar_contrasena_seleccionada():
+        seleccion = tree.selection()
+        if not seleccion:
+            messagebox.showwarning("Advertencia", "Por favor, seleccione un registro de la tabla.", parent=ventana_registros)
+            return
+
+        item = tree.item(seleccion[0])
+        registro_id = item['values'][0]
+
+        # Buscar la contraseña descifrada en memoria
+        contrasena_copiada = None
+        for id_reg, sitio, usuario, contrasena_real in datos_descifrados:
+            if id_reg == registro_id:
+                contrasena_copiada = contrasena_real
+                break
+
+        if contrasena_copiada and "Error al descifrar" not in str(contrasena_copiada):
+            root.clipboard_clear()
+            root.clipboard_append(contrasena_copiada)
+            root.update()
+            messagebox.showinfo("Copiado", "✅ Contraseña copiada al portapapeles.", parent=ventana_registros)
+        else:
+            messagebox.showerror("Error", "No se pudo copiar la contraseña.", parent=ventana_registros)
+
+    # Frame de botones
+    frame_btns_reg = tk.Frame(ventana_registros)
+    frame_btns_reg.pack(pady=10)
+
+    # Botón de copiar contraseña
+    btn_copiar = tk.Button(frame_btns_reg, text="📋 Copiar Contraseña", command=copiar_contrasena_seleccionada,
+                           bg="#2196F3", fg="white", font=("Arial", 10, "bold"), cursor="hand2")
+    btn_copiar.pack(side="left", padx=5)
+
+    # Botón de eliminar
+    btn_eliminar = tk.Button(frame_btns_reg, text="🗑 Eliminar Registro", command=eliminar_registro,
+                             bg="#f44336", fg="white", font=("Arial", 10, "bold"), cursor="hand2")
+    btn_eliminar.pack(side="left", padx=5)
+
+
+# --- VENTANA PRINCIPAL ---
+root = tk.Tk()
+root.title("Gestor de Contraseñas 🔐")
+aplicar_icono(root)
+centrar_ventana(root, 420, 360)
+root.resizable(False, False)
+
+# Estilo básico
+font_label = ("Arial", 10, "bold")
+font_entry = ("Arial", 10)
+
+# Título
+titulo = tk.Label(root, text="Gestor de Contraseñas 🔐", font=("Arial", 14, "bold"))
+titulo.grid(row=0, column=0, columnspan=2, pady=15)
+
+# Campo Sitio
+tk.Label(root, text="Sitio / App:", font=font_label).grid(row=1, column=0, padx=12, pady=5, sticky="e")
+entry_sitio = tk.Entry(root, width=28, font=font_entry)
+entry_sitio.grid(row=1, column=1, padx=12, pady=5, sticky="w")
+
+# Campo Usuario
+tk.Label(root, text="Usuario:", font=font_label).grid(row=2, column=0, padx=12, pady=5, sticky="e")
+entry_usuario = tk.Entry(root, width=28, font=font_entry)
+entry_usuario.grid(row=2, column=1, padx=12, pady=5, sticky="w")
+
+# Campo Contrasena
+tk.Label(root, text="Contraseña:", font=font_label).grid(row=3, column=0, padx=12, pady=5, sticky="e")
+entry_contrasena = tk.Entry(root, width=28, font=font_entry, show="*")
+entry_contrasena.grid(row=3, column=1, padx=12, pady=5, sticky="w")
+
+# Botón para guardar
+btn_guardar = tk.Button(root, text="Guardar Credenciales 🔒", command=guardar_datos,
+                        bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), cursor="hand2", width=24)
+btn_guardar.grid(row=4, column=0, columnspan=2, pady=8)
+
+# Botón para ver registros
+btn_ver = tk.Button(root, text="Ver Contraseñas Guardadas", command=ver_registros,
+                    bg="#2196F3", fg="white", font=("Arial", 10, "bold"), cursor="hand2", width=24)
+btn_ver.grid(row=5, column=0, columnspan=2, pady=4)
+
+# Acciones adicionales: Cambiar Clave y Bloquear
+frame_acciones = tk.Frame(root)
+frame_acciones.grid(row=6, column=0, columnspan=2, pady=12)
+
+btn_cambiar_clave = tk.Button(
+    frame_acciones, text="Cambiar Clave", command=cambiar_contrasena_maestra,
+    bg="#607D8B", fg="white", font=("Arial", 9, "bold"), cursor="hand2"
+)
+btn_cambiar_clave.pack(side="left", padx=5)
+
+btn_bloquear = tk.Button(
+    frame_acciones, text="Bloquear Baúl", command=solicitar_acceso_maestro,
+    bg="#FF9800", fg="white", font=("Arial", 9, "bold"), cursor="hand2"
+)
+btn_bloquear.pack(side="left", padx=5)
+
+# Iniciar la aplicación solicitando contraseña maestra
+if __name__ == "__main__":
+    solicitar_acceso_maestro()
+    root.mainloop()
